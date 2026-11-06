@@ -8,7 +8,7 @@
 # See build-scripts/ for wrappers around these commands.
 
 # ---- shared base for the two JVM components ----
-FROM openjdk:11-jre-slim AS jvm-base
+FROM eclipse-temurin:11-jre AS jvm-base
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 RUN groupadd -g 1001 appgroup && useradd -r -u 1001 -g appgroup appuser
 WORKDIR /app
@@ -32,7 +32,7 @@ ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
 ENTRYPOINT ["sh", "-c", "java ${JAVA_OPTS} -jar app.jar"]
 
 # ---- webapp target (static nginx, no JVM) ----
-FROM nginx:1.21-alpine AS webapp
+FROM nginx:1.27-alpine AS webapp
 RUN addgroup -g 1001 -S appgroup && adduser -S appuser -u 1001 -G appgroup
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY mime.types /etc/nginx/mime.types
@@ -43,5 +43,5 @@ RUN rm -f /etc/nginx/conf.d/default.conf && \
 USER appuser
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8080/health || exit 1
+    CMD wget -qO- http://localhost:8080/health || exit 1
 CMD ["nginx", "-g", "daemon off;"]
