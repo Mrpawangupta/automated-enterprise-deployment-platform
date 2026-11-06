@@ -1,1 +1,7 @@
 .DS_Store
+
+# Terraform local files
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
