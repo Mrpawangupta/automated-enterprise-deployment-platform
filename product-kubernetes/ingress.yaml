@@ -4,15 +4,18 @@ metadata:
   name: analytics-api
   namespace: analytics
   annotations:
-    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/group.name: analytics
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
     alb.ingress.kubernetes.io/healthcheck-path: /actuator/health
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS-1-2-Ext-2018-06
     # Placeholder - replace per environment with your real ACM cert ARN
     # (dev/stage/prod each need their own certificate).
     alb.ingress.kubernetes.io/certificate-arn: REPLACE_WITH_ACM_CERT_ARN
 spec:
+  ingressClassName: alb
   rules:
   - host: api.analytics.company.com
     http:
@@ -31,13 +34,16 @@ metadata:
   name: analytics-web
   namespace: analytics
   annotations:
-    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/group.name: analytics
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
     alb.ingress.kubernetes.io/healthcheck-path: /health
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS-1-2-Ext-2018-06
     alb.ingress.kubernetes.io/certificate-arn: REPLACE_WITH_ACM_CERT_ARN
 spec:
+  ingressClassName: alb
   rules:
   - host: app.analytics.company.com
     http:
