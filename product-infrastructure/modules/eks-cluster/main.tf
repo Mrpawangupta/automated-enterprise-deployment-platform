@@ -55,7 +55,14 @@ resource "aws_eks_node_group" "this" {
   capacity_type  = each.value.capacity_type
 
   labels = merge(each.value.labels, { component = each.key })
-  taint  = each.value.taints
+  dynamic "taint" {
+    for_each = each.value.taints
+    content {
+      key    = taint.value.key
+      value  = taint.value.value
+      effect = taint.value.effect
+    }
+  }
 
   update_config {
     max_unavailable_percentage = 33

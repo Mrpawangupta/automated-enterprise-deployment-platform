@@ -58,9 +58,9 @@ resource "aws_subnet" "private" {
 }
 
 resource "aws_eip" "nat" {
-  count  = var.single_nat_gateway ? 1 : var.az_count
-  domain = "vpc"
-  tags   = merge(var.tags, { Name = "${var.name_prefix}-nat-eip-${count.index}" })
+  count = var.single_nat_gateway ? 1 : var.az_count
+  vpc   = true
+  tags  = merge(var.tags, { Name = "${var.name_prefix}-nat-eip-${count.index}" })
 }
 
 resource "aws_nat_gateway" "this" {
