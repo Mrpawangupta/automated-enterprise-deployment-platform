@@ -42,7 +42,7 @@ I reviewed the main components (`product-docker`, `product-kubernetes`, `product
 |--------|-------|
 | 2 errors (unsupported `taint` argument, `domain` on `aws_eip`) | `Success! The configuration is valid.` |
 
-Screenshots: `docs/proof/terraform-validate-before.png` and `docs/proof/terraform-validate-after.png`
+Screenshot (after fix): `docs/proof/terraform-validate-after.png`
 
 ## 3. Dependencies and Setup Instructions
 
@@ -68,7 +68,6 @@ Screenshots: `docs/proof/terraform-validate-before.png` and `docs/proof/terrafor
 ```bash
 git clone https://github.com/Mrpawangupta/automated-enterprise-deployment-platform.git
 cd automated-enterprise-deployment-platform
-Screenshot: `docs/proof/terraform-validate-after.png`
 cd product-infrastructure
 terraform init -backend=false
 terraform fmt -check -recursive
