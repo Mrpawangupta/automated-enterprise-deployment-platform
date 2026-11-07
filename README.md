@@ -68,7 +68,7 @@ Screenshots: `docs/proof/terraform-validate-before.png` and `docs/proof/terrafor
 ```bash
 git clone https://github.com/Mrpawangupta/automated-enterprise-deployment-platform.git
 cd automated-enterprise-deployment-platform
-git checkout fix/terraform-validate
+Screenshot: `docs/proof/terraform-validate-after.png`
 cd product-infrastructure
 terraform init -backend=false
 terraform fmt -check -recursive
