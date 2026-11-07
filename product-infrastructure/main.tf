@@ -55,13 +55,13 @@ module "vpc_networking" {
 module "eks_cluster" {
   source = "./modules/eks-cluster"
 
-  cluster_name           = local.name_prefix
-  k8s_version            = var.k8s_version
-  private_subnet_ids     = module.vpc_networking.private_subnet_ids
-  public_access_enabled  = var.eks_public_access_enabled
-  public_access_cidrs    = var.eks_public_access_cidrs
-  node_groups            = var.node_groups
-  tags                   = local.common_tags
+  cluster_name          = local.name_prefix
+  k8s_version           = var.k8s_version
+  private_subnet_ids    = module.vpc_networking.private_subnet_ids
+  public_access_enabled = var.eks_public_access_enabled
+  public_access_cidrs   = var.eks_public_access_cidrs
+  node_groups           = var.node_groups
+  tags                  = local.common_tags
 }
 
 module "security_baseline" {

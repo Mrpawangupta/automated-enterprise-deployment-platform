@@ -32,9 +32,12 @@ spec:
         prometheus.io/path: "/actuator/prometheus"
     spec:
       securityContext:
+        runAsNonRoot: true
         runAsUser: 1001
         runAsGroup: 1001
         fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -53,6 +56,11 @@ spec:
         # product-deployment-pipeline/scripts/deploy.sh
         image: "analytics-api:latest"
         imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         ports:
         - containerPort: 8080
           name: http
@@ -118,13 +126,20 @@ spec:
         component: webapp
     spec:
       securityContext:
+        runAsNonRoot: true
         runAsUser: 1001
         runAsGroup: 1001
         fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: web
         image: "analytics-web:latest"
         imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         ports:
         - containerPort: 8080
           name: http
@@ -175,6 +190,12 @@ spec:
             app: analytics-data-processor
         spec:
           restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            seccompProfile:
+              type: RuntimeDefault
           tolerations:
           - key: "spot"
             operator: "Equal"
@@ -183,6 +204,10 @@ spec:
           containers:
           - name: data-processor
             image: "analytics-data-processor:latest"
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
             envFrom:
             - configMapRef:
                 name: api-config
