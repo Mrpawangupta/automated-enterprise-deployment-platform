@@ -1,3 +1,42 @@
+// Helper: runs the given body with AWS credentials fetched from Vault.
+// withVault requires a body, because the secrets are only exposed inside it.
+def withAwsCreds(Closure body) {
+    withVault([
+        configuration: [timeout: 60],
+        vaultSecrets: [
+            [path: "secret/aws/${params.ENVIRONMENT}", engineVersion: 2, secretValues: [
+                [envVar: 'AWS_ACCESS_KEY_ID', vaultKey: 'aws_access_key_id'],
+                [envVar: 'AWS_SECRET_ACCESS_KEY', vaultKey: 'aws_secret_access_key']
+            ]]
+        ]
+    ]) {
+        body()
+    }
+}
+
+// Helper: builds a token-based kubeconfig for the EKS cluster.
+// The kubectl container does not ship the AWS CLI, so cluster details and the
+// auth token are fetched in the awscli container first.
+// Must be called inside withAwsCreds.
+def eksLogin() {
+    container('awscli') {
+        sh '''
+        aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.endpoint' --output text > .eks_endpoint
+        aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.certificateAuthority.data' --output text > .eks_ca
+        aws eks get-token --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'status.token' --output text > .eks_token
+        '''
+    }
+    container('kubectl') {
+        sh '''
+        base64 -d .eks_ca > .eks_ca.crt
+        kubectl config set-cluster eks --server="$(cat .eks_endpoint)" --certificate-authority=.eks_ca.crt --embed-certs=true
+        kubectl config set-credentials ci --token="$(cat .eks_token)"
+        kubectl config set-context ci --cluster=eks --user=ci
+        kubectl config use-context ci
+        '''
+    }
+}
+
 pipeline {
     agent {
         kubernetes {
@@ -14,12 +53,20 @@ spec:
     resources:
       limits: {cpu: 500m, memory: 1Gi}
       requests: {cpu: 200m, memory: 512Mi}
+  - name: awscli
+    image: amazon/aws-cli:2.13.0
+    command: ['cat']
+    tty: true
   - name: terraform
     image: hashicorp/terraform:1.3
     command: ['cat']
     tty: true
   - name: kubectl
-    image: bitnami/kubectl:1.24
+    image: bitnami/kubectl:1.27
+    command: ['cat']
+    tty: true
+  - name: helm
+    image: alpine/helm:3.12.3
     command: ['cat']
     tty: true
   - name: docker
@@ -39,16 +86,15 @@ spec:
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
         timeout(time: 2, unit: 'HOURS')
-        retry(3)
         disableConcurrentBuilds()
     }
 
     environment {
-        AWS_REGION       = 'us-east-1'
-        ECR_REGISTRY     = '123456789012.dkr.ecr.us-east-1.amazonaws.com'
-        CLUSTER_NAME     = "analytics-${params.ENVIRONMENT}"
-        TF_STATE_BUCKET  = "analytics-tf-state-${AWS_ACCOUNT_ID}"
-        VAULT_ADDR       = 'https://vault.company.com:8200'
+        AWS_REGION     = 'us-east-1'
+        VAULT_ADDR     = 'https://vault.company.com:8200'   // Placeholder: replace with your Vault URL
+        SONAR_HOST_URL = 'https://sonar.company.com'        // Placeholder: replace with your SonarQube URL
+        API_HOST       = 'api.analytics.company.com'        // Must match the host in ingress.yaml
+        WEB_HOST       = 'app.analytics.company.com'        // Must match the host in ingress.yaml
     }
 
     parameters {
@@ -57,95 +103,146 @@ spec:
         choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Terraform action to perform')
         booleanParam(name: 'RUN_TESTS', defaultValue: true, description: 'Run automated tests')
         booleanParam(name: 'SECURITY_SCAN', defaultValue: true, description: 'Run security scans')
-        string(name: 'IMAGE_TAG', defaultValue: '${BUILD_ID}', description: 'Docker image tag')
+        booleanParam(name: 'CHECKOV_BLOCKING', defaultValue: false, description: 'Fail the build on Checkov findings (the repository currently has known findings)')
+        booleanParam(name: 'SETUP_MONITORING', defaultValue: false, description: 'Deploy EFK and Prometheus/Grafana (enable after the monitoring values files are fixed)')
+        string(name: 'IMAGE_TAG', defaultValue: '', description: 'Docker image tag (defaults to BUILD_ID when empty)')
+        string(name: 'JENKINS_ROLE_ARN', defaultValue: '', description: 'ARN of the IAM principal Jenkins authenticates as (required by Terraform)')
+        string(name: 'APP_REPO_URL', defaultValue: 'https://github.com/company/analytics-app.git', description: 'Application source repository')
     }
 
     stages {
         stage('Initialize') {
             steps {
                 script {
-                    withVault([
-                        configuration: [timeout: 60],
-                        vaultSecrets: [
-                            [path: "secret/aws/${params.ENVIRONMENT}", engineVersion: 2, secretValues: [
-                                [envVar: 'AWS_ACCESS_KEY_ID', vaultKey: 'aws_access_key_id'],
-                                [envVar: 'AWS_SECRET_ACCESS_KEY', vaultKey: 'aws_secret_access_key']
-                            ]],
-                            [path: "secret/kubernetes/${params.ENVIRONMENT}", engineVersion: 2, secretValues: [
-                                [envVar: 'KUBECONFIG', vaultKey: 'kubeconfig']
-                            ]]
-                        ]
-                    ])
-                    sh '''
-                    aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
-                    aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
-                    aws configure set region ${AWS_REGION}
-                    '''
-                    writeFile file: 'kubeconfig.yaml', text: env.KUBECONFIG
-                    env.KUBECONFIG = 'kubeconfig.yaml'
+                    env.IMAGE_TAG    = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.BUILD_ID
+                    env.CLUSTER_NAME = "analytics-${params.ENVIRONMENT}"
+                    env.KUBECONFIG   = "${env.WORKSPACE}/kubeconfig.yaml"
+
+                    if (!params.JENKINS_ROLE_ARN?.trim()) {
+                        error('JENKINS_ROLE_ARN parameter is required (Terraform variable jenkins_role_arn).')
+                    }
+
+                    dir('infra') {
+                        checkout scm
+                    }
+                    if (params.ACTION == 'apply') {
+                        dir('app') {
+                            git url: params.APP_REPO_URL, branch: 'main'
+                        }
+                    }
+
+                    withAwsCreds {
+                        container('awscli') {
+                            env.AWS_ACCOUNT_ID = sh(
+                                script: 'aws sts get-caller-identity --query Account --output text',
+                                returnStdout: true
+                            ).trim()
+                        }
+                    }
+                    env.ECR_REGISTRY    = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+                    env.TF_STATE_BUCKET = "analytics-tf-state-${env.AWS_ACCOUNT_ID}"
+                    echo "Account: ${env.AWS_ACCOUNT_ID}, tag: ${env.IMAGE_TAG}, cluster: ${env.CLUSTER_NAME}"
                 }
-
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'infra']],
-                    userRemoteConfigs: [[url: 'https://github.com/SkillfymeLearning/Enterprise-Deployment-Platform.git']]
-                ])
-
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'app']],
-                    userRemoteConfigs: [[url: 'https://github.com/company/analytics-app.git']]
-                ])
             }
         }
 
-        stage('Security Scan') {
-            when { expression { params.SECURITY_SCAN == true } }
+        stage('IaC Scan (Checkov)') {
+            when { expression { params.SECURITY_SCAN } }
             steps {
-                script {
-                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-                        sh '''
-                        cd app
-                        mvn sonar:sonar -Dsonar.projectKey=analytics-platform \
-                            -Dsonar.host.url=https://sonar.company.com -Dsonar.login=${SONAR_TOKEN}
-                        '''
+                container('docker') {
+                    script {
+                        def softFail = params.CHECKOV_BLOCKING ? '' : '--soft-fail'
+                        sh "docker run --rm -v ${env.WORKSPACE}/infra/product-infrastructure:/iac bridgecrew/checkov -d /iac ${softFail}"
                     }
-                    sh '''
-                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-                        aquasec/trivy:latest image --exit-code 1 --severity HIGH,CRITICAL \
-                        ${ECR_REGISTRY}/analytics-api:${IMAGE_TAG}
-                    docker run --rm -v "${WORKSPACE}/infra/product-infrastructure:/iac" bridgecrew/checkov -d /iac
-                    '''
                 }
             }
         }
 
         stage('Build & Test') {
+            when { expression { params.ACTION == 'apply' } }
             steps {
-                script {
+                container('maven') {
                     dir('app') {
-                        sh 'mvn clean package -DskipTests=false'
-                        if (params.RUN_TESTS) {
-                            sh 'mvn test'
-                            junit 'target/surefire-reports/*.xml'
+                        sh 'mvn clean package -DskipTests'
+                        script {
+                            if (params.RUN_TESTS) {
+                                sh 'mvn test'
+                                junit 'target/surefire-reports/*.xml'
+                            }
                         }
                     }
-                    // Single multi-target Dockerfile in product-docker/ builds all three images
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            when { expression { params.ACTION == 'apply' && params.SECURITY_SCAN } }
+            steps {
+                container('maven') {
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                        dir('app') {
+                            // qualitygate.wait=true makes the build fail when the quality gate fails
+                            sh '''
+                            mvn sonar:sonar -Dsonar.projectKey=analytics-platform \
+                                -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_TOKEN \
+                                -Dsonar.qualitygate.wait=true
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Images') {
+            when { expression { params.ACTION == 'apply' } }
+            steps {
+                container('docker') {
+                    // A single multi-target Dockerfile in product-docker/ builds all three images
                     sh '''
                     cp -r app/target infra/product-docker/target
                     cd infra/product-docker
-                    docker build --target api            -t ${ECR_REGISTRY}/analytics-api:${IMAGE_TAG} .
-                    docker build --target webapp          -t ${ECR_REGISTRY}/analytics-web:${IMAGE_TAG} .
-                    docker build --target data-processor  -t ${ECR_REGISTRY}/analytics-data-processor:${IMAGE_TAG} .
-
-                    aws ecr get-login-password --region ${AWS_REGION} | \
-                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                    docker push ${ECR_REGISTRY}/analytics-api:${IMAGE_TAG}
-                    docker push ${ECR_REGISTRY}/analytics-web:${IMAGE_TAG}
-                    docker push ${ECR_REGISTRY}/analytics-data-processor:${IMAGE_TAG}
+                    docker build --target api            -t $ECR_REGISTRY/analytics-api:$IMAGE_TAG .
+                    docker build --target webapp         -t $ECR_REGISTRY/analytics-web:$IMAGE_TAG .
+                    docker build --target data-processor -t $ECR_REGISTRY/analytics-data-processor:$IMAGE_TAG .
                     '''
+                }
+            }
+        }
+
+        stage('Image Scan (Trivy)') {
+            when { expression { params.ACTION == 'apply' && params.SECURITY_SCAN } }
+            steps {
+                container('docker') {
+                    // Runs after the build and before the push, so vulnerable images are never published
+                    sh '''
+                    for img in analytics-api analytics-web analytics-data-processor; do
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                            aquasec/trivy:latest image --exit-code 1 --severity HIGH,CRITICAL \
+                            $ECR_REGISTRY/$img:$IMAGE_TAG
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Push Images') {
+            when { expression { params.ACTION == 'apply' } }
+            steps {
+                script {
+                    withAwsCreds {
+                        container('awscli') {
+                            sh 'aws ecr get-login-password --region "$AWS_REGION" > .ecr_pass'
+                        }
+                        container('docker') {
+                            sh '''
+                            docker login --username AWS --password-stdin $ECR_REGISTRY < .ecr_pass
+                            rm -f .ecr_pass
+                            for img in analytics-api analytics-web analytics-data-processor; do
+                                docker push $ECR_REGISTRY/$img:$IMAGE_TAG
+                            done
+                            '''
+                        }
+                    }
                 }
             }
         }
@@ -154,19 +251,24 @@ spec:
             when { expression { params.ACTION in ['plan', 'apply'] } }
             steps {
                 script {
-                    dir('infra/product-infrastructure') {
-                        sh """
-                        terraform init \
-                            -backend-config="bucket=${TF_STATE_BUCKET}" \
-                            -backend-config="region=${AWS_REGION}"
-                        terraform workspace select ${params.ENVIRONMENT} || terraform workspace new ${params.ENVIRONMENT}
-                        terraform plan \
-                            -var-file="environments/${params.ENVIRONMENT}/${params.ENVIRONMENT}.tfvars" \
-                            -var="image_tag=${IMAGE_TAG}" \
-                            -out=tfplan.binary
-                        terraform show -json tfplan.binary > tfplan.json
-                        """
-                        archiveArtifacts artifacts: 'tfplan.json'
+                    withAwsCreds {
+                        container('terraform') {
+                            dir('infra/product-infrastructure') {
+                                sh """
+                                terraform init -input=false \
+                                    -backend-config="bucket=${env.TF_STATE_BUCKET}" \
+                                    -backend-config="region=${env.AWS_REGION}"
+                                terraform workspace select ${params.ENVIRONMENT} || terraform workspace new ${params.ENVIRONMENT}
+                                terraform plan -input=false \
+                                    -var-file="environments/${params.ENVIRONMENT}/${params.ENVIRONMENT}.tfvars" \
+                                    -var="image_tag=${env.IMAGE_TAG}" \
+                                    -var="jenkins_role_arn=${params.JENKINS_ROLE_ARN}" \
+                                    -out=tfplan.binary
+                                terraform show -json tfplan.binary > tfplan.json
+                                """
+                                archiveArtifacts artifacts: 'tfplan.json'
+                            }
+                        }
                     }
                 }
             }
@@ -185,11 +287,38 @@ spec:
             when { expression { params.ACTION == 'apply' } }
             steps {
                 script {
-                    dir('infra/product-infrastructure') {
-                        sh 'terraform apply -auto-approve tfplan.binary'
-                        sh 'terraform output -json > outputs.json'
-                        def outputs = readJSON file: 'outputs.json'
-                        env.K8S_CLUSTER_ENDPOINT = outputs.cluster_endpoint.value
+                    withAwsCreds {
+                        container('terraform') {
+                            dir('infra/product-infrastructure') {
+                                sh 'terraform apply -input=false -auto-approve tfplan.binary'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Infrastructure Destroy') {
+            when { expression { params.ACTION == 'destroy' } }
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    input message: "Destroy ALL infrastructure in '${params.ENVIRONMENT}'? This action cannot be undone.", ok: 'Destroy'
+                }
+                script {
+                    withAwsCreds {
+                        container('terraform') {
+                            dir('infra/product-infrastructure') {
+                                sh """
+                                terraform init -input=false \
+                                    -backend-config="bucket=${env.TF_STATE_BUCKET}" \
+                                    -backend-config="region=${env.AWS_REGION}"
+                                terraform workspace select ${params.ENVIRONMENT}
+                                terraform destroy -input=false -auto-approve \
+                                    -var-file="environments/${params.ENVIRONMENT}/${params.ENVIRONMENT}.tfvars" \
+                                    -var="jenkins_role_arn=${params.JENKINS_ROLE_ARN}"
+                                """
+                            }
+                        }
                     }
                 }
             }
@@ -199,54 +328,94 @@ spec:
             when { expression { params.ACTION == 'apply' } }
             steps {
                 script {
-                    sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+                    // Marks that the deploy stage has started; the prod rollback in post.failure depends on it
+                    env.DEPLOY_STARTED = 'true'
+                    withAwsCreds {
+                        eksLogin()
+                        container('kubectl') {
+                            // The image tag is substituted in a temporary copy,
+                            // so the tracked deployment.yaml is never modified.
+                            sh '''
+                            kubectl create namespace analytics --dry-run=client -o yaml | kubectl apply -f -
+                            cd infra/product-kubernetes
+                            sed -e "s#analytics-api:latest#$ECR_REGISTRY/analytics-api:$IMAGE_TAG#g" \
+                                -e "s#analytics-web:latest#$ECR_REGISTRY/analytics-web:$IMAGE_TAG#g" \
+                                -e "s#analytics-data-processor:latest#$ECR_REGISTRY/analytics-data-processor:$IMAGE_TAG#g" \
+                                deployment.yaml > deployment.rendered.yaml
 
-                    // No Kustomize - product-kubernetes/ is a flat set of manifests,
-                    // so the image tag is substituted in place before apply.
-                    dir('infra/product-kubernetes') {
-                        sh """
-                        kubectl create namespace analytics --dry-run=client -o yaml | kubectl apply -f -
-                        sed -i "s#analytics-api:latest#${ECR_REGISTRY}/analytics-api:${IMAGE_TAG}#g" deployment.yaml
-                        sed -i "s#analytics-web:latest#${ECR_REGISTRY}/analytics-web:${IMAGE_TAG}#g" deployment.yaml
-                        sed -i "s#analytics-data-processor:latest#${ECR_REGISTRY}/analytics-data-processor:${IMAGE_TAG}#g" deployment.yaml
+                            kubectl apply -f configmap.yaml
+                            # secrets.yaml is only a placeholder template; never overwrite an existing secret
+                            if kubectl get secret api-secrets -n analytics >/dev/null 2>&1; then
+                                echo "api-secrets already exists - not overwriting"
+                            else
+                                echo "WARNING: applying placeholder api-secrets template"
+                                kubectl apply -f secrets.yaml
+                            fi
+                            kubectl apply -f deployment.rendered.yaml
+                            kubectl apply -f service.yaml
+                            kubectl apply -f ingress.yaml
+                            rm -f deployment.rendered.yaml
 
-                        kubectl apply -f configmap.yaml
-                        kubectl apply -f secrets.yaml
-                        kubectl apply -f deployment.yaml
-                        kubectl apply -f service.yaml
-                        kubectl apply -f ingress.yaml
-
-                        kubectl wait --for=condition=available --timeout=300s deployment/analytics-api -n analytics
-                        kubectl wait --for=condition=available --timeout=300s deployment/analytics-web -n analytics
-
-                        git checkout -- deployment.yaml
-                        """
+                            kubectl wait --for=condition=available --timeout=300s deployment/analytics-api -n analytics
+                            kubectl wait --for=condition=available --timeout=300s deployment/analytics-web -n analytics
+                            '''
+                        }
                     }
                 }
             }
         }
 
         stage('Smoke Tests') {
+            when { expression { params.ACTION == 'apply' } }
             steps {
-                script {
+                container('kubectl') {
                     sh '''
-                    API_URL=$(kubectl get ingress analytics-api -n analytics -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-                    curl -f https://${API_URL}/actuator/health || exit 1
-
-                    WEB_URL=$(kubectl get ingress analytics-web -n analytics -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-                    curl -f https://${WEB_URL}/health || exit 1
+                    kubectl get ingress analytics-api -n analytics -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' > .api_lb
+                    kubectl get ingress analytics-web -n analytics -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' > .web_lb
+                    test -s .api_lb && test -s .web_lb || { echo "ALB hostname is not available yet"; exit 1; }
+                    '''
+                }
+                container('maven') {
+                    // The Host header is required because ingress rules match on hostname
+                    sh '''
+                    check() {
+                        for i in $(seq 1 30); do
+                            curl -fsk -H "Host: $2" "https://$1$3" >/dev/null && { echo "OK: $2$3"; return 0; }
+                            sleep 10
+                        done
+                        echo "FAILED: $2$3"; return 1
+                    }
+                    check "$(cat .api_lb)" "$API_HOST" /actuator/health
+                    check "$(cat .web_lb)" "$WEB_HOST" /health
                     '''
                 }
             }
         }
 
         stage('Monitoring Setup') {
+            when { expression { params.ACTION == 'apply' && params.SETUP_MONITORING } }
             steps {
                 script {
-                    dir('infra/monitoring') {
+                    withAwsCreds {
+                        eksLogin()
+                    }
+                    container('kubectl') {
                         sh '''
-                        kubectl apply -k efk/
-                        kubectl apply -f dashboards/ -n monitoring
+                        kubectl apply -k infra/monitoring/efk/
+                        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+                        kubectl create configmap grafana-analytics-dashboard -n monitoring \
+                            --from-file=infra/monitoring/dashboards/grafana-analytics-dashboard.json \
+                            --dry-run=client -o yaml | kubectl apply -f -
+                        kubectl label configmap grafana-analytics-dashboard -n monitoring grafana_dashboard=1 --overwrite
+                        '''
+                    }
+                    container('helm') {
+                        sh '''
+                        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                        helm repo update
+                        helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+                            --namespace monitoring \
+                            -f infra/monitoring/dashboards/kube-prometheus-stack-values.yaml
                         '''
                     }
                 }
@@ -256,36 +425,41 @@ spec:
 
     post {
         always {
-            sh '''
-            docker system prune -f
-            rm -f kubeconfig.yaml
-            '''
-            script {
-                def status = currentBuild.currentResult
-                def duration = currentBuild.duration
-                sh """
-                curl -X POST https://monitoring.company.com/metrics \
-                    -d 'deployment_duration_seconds{environment="${params.ENVIRONMENT}"} ${duration/1000}' \
-                    -d 'deployment_status{environment="${params.ENVIRONMENT}",status="${status}"} 1'
-                """
+            container('docker') {
+                sh 'docker system prune -f || true'
             }
         }
         success {
             slackSend(channel: '#deployments', color: 'good',
-                message: "✅ Deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER} to ${params.ENVIRONMENT}")
+                message: "Deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${params.ACTION}) to ${params.ENVIRONMENT}")
             archiveArtifacts artifacts: '**/test-results/**/*.xml, **/coverage/**/*', allowEmptyArchive: true
         }
         failure {
             slackSend(channel: '#deployments-alerts', color: 'danger',
-                message: "❌ Deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} to ${params.ENVIRONMENT}")
+                message: "Deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${params.ACTION}) to ${params.ENVIRONMENT}")
             script {
-                if (params.ENVIRONMENT == 'prod') {
-                    sh '''
-                    kubectl rollout undo deployment/analytics-api -n analytics
-                    kubectl rollout undo deployment/analytics-web -n analytics
-                    '''
+                // Roll back only for prod applies where the deploy stage has already started,
+                // so a failed scan or build never reverts a healthy deployment.
+                if (params.ENVIRONMENT == 'prod' && params.ACTION == 'apply' && env.DEPLOY_STARTED == 'true') {
+                    try {
+                        withAwsCreds {
+                            eksLogin()
+                            container('kubectl') {
+                                sh '''
+                                kubectl rollout undo deployment/analytics-api -n analytics
+                                kubectl rollout undo deployment/analytics-web -n analytics
+                                '''
+                            }
+                        }
+                    } catch (err) {
+                        echo "Rollback failed: ${err}"
+                    }
                 }
             }
+        }
+        cleanup {
+            // cleanup runs last, so the rollback above can still use the credentials files
+            sh 'rm -f kubeconfig.yaml .eks_endpoint .eks_ca .eks_ca.crt .eks_token .ecr_pass .api_lb .web_lb'
         }
     }
 }
